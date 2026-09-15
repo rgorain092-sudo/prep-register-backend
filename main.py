@@ -58,9 +58,6 @@ class LoginRequest(BaseModel):
     password: str
 
 
-
-
-
 class GenerateMockTestRequest(BaseModel):
     domain: str          # EXAMS | SKILLS | LANGUAGES
     target_tag: str      # e.g. "UPSC Prelims GS", "RBI Grade B Quant", "Python Core"
@@ -108,7 +105,7 @@ async def signup(req: SignupRequest):
 async def login(req: LoginRequest):
     row = await pool.fetchrow("SELECT id, username, password_hash FROM users WHERE email = $1", req.email)
     if not row or not auth.verify_password(req.password, row["password_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+        raise HTTPException(status_code=411, detail="Invalid credentials")
     token = auth.create_access_token(str(row["id"]))
     return {"access_token": token, "token_type": "bearer", "user": {"id": str(row["id"]), "username": row["username"]}}
 
@@ -231,130 +228,50 @@ async def ai_chat(req: ChatRequest, user_id: str = Depends(auth.get_current_user
 # ---------- Mock tests ----------
 
 @app.post("/mock-tests/generate")
-async def generate_mock_test(req: GenerateMockTestRequest, user_id: str = Depends(auth.get_current_user_id)):
+async def generate_mock_test_endpoint(req: GenerateMockTestRequest, user_id: str = Depends(auth.get_current_user_id)):
     try:
         payload = ai_service.generate_mock_test(req.domain, req.target_tag, req.difficulty, req.num_questions)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Mock test generation failed: {e}")
 
     test_id = str(uuid.uuid4())
-    total_marks = len(payload["questions"])
+    questions_list = payload.get("questions", [])
+    total_questions = len(questions_list)
+    
     await pool.execute(
-        """INSERT INTO mock_test_series
-           (id, title, associated_domain, target_tag, difficulty, duration_minutes, total_marks, question_payload)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)""",
-        test_id, f"{req.target_tag} — {req.difficulty.title()}", req.domain, req.target_tag,
-        req.difficulty, req.duration_minutes, total_marks, __import__("json").dumps(payload),
+        """INSERT INTO mock_tests (id, user_id, domain, target_tag, difficulty, total_questions, structure_json)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)""",
+        test_id, user_id, req.domain, req.target_tag, req.difficulty, total_questions, __import__("json").dumps(payload)
     )
-    # Strip correct_index/explanation before returning so the client can't cheat by reading the payload.
-    questions_for_client = [
-        {"question": q["question"], "options": q["options"]} for q in payload["questions"]
-    ]
-    return {
-        "test_id": test_id, "title": f"{req.target_tag} — {req.difficulty.title()}",
-        "duration_minutes": req.duration_minutes, "questions": questions_for_client,
-    }
-
-
-@app.get("/mock-tests")
-async def list_mock_tests(domain: Optional[str] = None):
-    if domain:
-        rows = await pool.fetch(
-            "SELECT id, title, associated_domain, target_tag, difficulty, duration_minutes, total_marks, created_at "
-            "FROM mock_test_series WHERE associated_domain = $1 ORDER BY created_at DESC", domain,
-        )
-    else:
-        rows = await pool.fetch(
-            "SELECT id, title, associated_domain, target_tag, difficulty, duration_minutes, total_marks, created_at "
-            "FROM mock_test_series ORDER BY created_at DESC LIMIT 50"
-        )
-    return [dict(r) for r in rows]
+    return {"test_id": test_id, "questions": questions_list, "duration_minutes": req.duration_minutes}
 
 
 @app.post("/mock-tests/submit")
-async def submit_attempt(req: SubmitAttemptRequest, user_id: str = Depends(auth.get_current_user_id)):
-    row = await pool.fetchrow("SELECT question_payload FROM mock_test_series WHERE id = $1", req.test_id)
+async def submit_test_attempt(req: SubmitAttemptRequest, user_id: str = Depends(auth.get_current_user_id)):
+    row = await pool.fetchrow("SELECT structure_json FROM mock_tests WHERE id = $1 AND user_id = $2", req.test_id, user_id)
     if not row:
         raise HTTPException(status_code=404, detail="Test not found")
-    import json
-    payload = row["question_payload"]
-    payload = json.loads(payload) if isinstance(payload, str) else payload
-    result = ai_service.grade_attempt(payload["questions"], req.answers)
-
+        
+    test_data = __import__("json").loads(row["structure_json"])
+    questions = test_data.get("questions", [])
+    
+    grading = ai_service.grade_attempt(questions, req.answers)
     attempt_id = str(uuid.uuid4())
+    
     await pool.execute(
-        """INSERT INTO test_attempts (id, user_id, test_id, score_obtained, accuracy_percentage, ai_performance_feedback)
+        """INSERT INTO test_attempts (id, test_id, user_id, score_obtained, total_questions, review_json)
            VALUES ($1, $2, $3, $4, $5, $6)""",
-        attempt_id, user_id, req.test_id, result["correct"], result["accuracy_percentage"],
-        f"{result['correct']}/{result['total']} correct.",
+        attempt_id, req.test_id, user_id, grading["correct"], grading["total"], __import__("json").dumps(grading)
     )
-    return {"attempt_id": attempt_id, **result}
+    return {"attempt_id": attempt_id, "grading": grading}
 
 
-@app.get("/test-attempts")
-async def my_attempts(user_id: str = Depends(auth.get_current_user_id)):
-    rows = await pool.fetch(
-        """SELECT ta.id, ta.score_obtained, ta.accuracy_percentage, ta.attempted_at,
-                  mt.title, mt.target_tag, mt.difficulty
-           FROM test_attempts ta JOIN mock_test_series mt ON mt.id = ta.test_id
-           WHERE ta.user_id = $1 ORDER BY ta.attempted_at DESC""",
-        user_id,
-    )
-    return [dict(r) for r in rows]
+# ---------- Routines & Current Affairs ----------
 
-
-# ---------- Study routine ----------
-
-@app.post("/routine/generate")
-async def generate_routine_route(req: RoutineRequest, user_id: str = Depends(auth.get_current_user_id)):
+@app.post("/routines/generate")
+async def generate_routine_endpoint(req: RoutineRequest, user_id: str = Depends(auth.get_current_user_id)):
     try:
-        routine = ai_service.generate_routine(req.available_hours_per_day, req.focus_targets)
+        schedule = ai_service.generate_routine(req.available_hours_per_day, req.focus_targets)
+        return {"routine": schedule}
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Routine generation failed: {e}")
-
-    await pool.execute("DELETE FROM study_routines WHERE user_id = $1", user_id)
-    for block in routine:
-        await pool.execute(
-            """INSERT INTO study_routines (id, user_id, day_of_week, start_time, end_time, focus_domain, topic_headline)
-               VALUES ($1, $2, $3, $4, $5, $6, $7)""",
-            str(uuid.uuid4()), user_id, block["day"], block["start_time"], block["end_time"],
-            block["domain_type"], block["topic"],
-        )
-    await pool.execute(
-        "UPDATE users SET daily_study_hours = $2 WHERE id = $1", user_id, req.available_hours_per_day
-    )
-    return {"routine": routine}
-
-
-@app.get("/routine")
-async def get_routine(user_id: str = Depends(auth.get_current_user_id)):
-    rows = await pool.fetch(
-        "SELECT * FROM study_routines WHERE user_id = $1 ORDER BY day_of_week, start_time", user_id
-    )
-    return [dict(r) for r in rows]
-
-
-@app.patch("/routine/{block_id}/complete")
-async def complete_block(block_id: str, user_id: str = Depends(auth.get_current_user_id)):
-    row = await pool.fetchrow(
-        "SELECT 1 FROM study_routines WHERE id = $1 AND user_id = $2", block_id, user_id
-    )
-    if not row:
-        raise HTTPException(status_code=404, detail="Not found")
-    await pool.execute("UPDATE study_routines SET completed = TRUE WHERE id = $1", block_id)
-    return {"completed": True}
-
-
-# ---------- Current affairs ----------
-
-@app.post("/current-affairs/digest")
-async def add_current_affairs_digest(req: CurrentAffairsDigestRequest):
-    try:
-        return await current_affairs_service.create_digest_entry(pool, req.target_exam, req.raw_text)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Digest summarization failed: {e}")
-
-
-@app.get("/current-affairs")
-async def get_current_affairs(target_exam: str):
-    return await current_affairs_service.list_for_exam(pool, target_exam)
+    
