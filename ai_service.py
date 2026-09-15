@@ -10,7 +10,9 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings
 embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
 vector_db = Chroma(persist_directory="./chroma_db", embedding_function=embeddings)
 
-AI_CLIENT = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+# Securely extract the API key string and prevent SDK credential fallback errors
+gemini_key = os.getenv("GEMINI_API_KEY")
+AI_CLIENT = genai.Client(api_key=gemini_key)
 MODEL = "gemini-2.5-flash"
 
 ARRANGER_SYSTEM_INSTRUCTION = """
@@ -178,3 +180,4 @@ Content:
         config=types.GenerateContentConfig(response_mime_type="application/json"),
     )
     return _parse_json_response(response.text)
+ 
