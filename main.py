@@ -15,8 +15,6 @@ import current_affairs_service
 
 app = FastAPI(title="AI Learning Platform")
 
-# Allow the frontend (hosted on a different domain — Netlify/Cloudflare Pages)
-# to call this API. Lock this down to your real frontend URL in production.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
@@ -68,7 +66,7 @@ class GenerateMockTestRequest(BaseModel):
 
 class SubmitAttemptRequest(BaseModel):
     test_id: str
-    answers: list[int]  # selected option index per question, in order
+    answers: list[int]
 
 
 class ChatRequest(BaseModel):
@@ -105,7 +103,7 @@ async def signup(req: SignupRequest):
 async def login(req: LoginRequest):
     row = await pool.fetchrow("SELECT id, username, password_hash FROM users WHERE email = $1", req.email)
     if not row or not auth.verify_password(req.password, row["password_hash"]):
-        raise HTTPException(status_code=411, detail="Invalid credentials")
+        raise HTTPException(status_code=401, detail="Invalid credentials")
     token = auth.create_access_token(str(row["id"]))
     return {"access_token": token, "token_type": "bearer", "user": {"id": str(row["id"]), "username": row["username"]}}
 
@@ -121,7 +119,7 @@ async def me(user_id: str = Depends(auth.get_current_user_id)):
     return dict(row)
 
 
-# ---------- Storage: single-shot upload (Supabase Storage, 50MB free-tier cap) ----------
+# ---------- Storage ----------
 
 @app.post("/storage/upload")
 async def upload_file(
@@ -133,7 +131,7 @@ async def upload_file(
     if len(file_bytes) > storage.MAX_FILE_SIZE:
         raise HTTPException(
             status_code=413,
-            detail=f"File exceeds {storage.MAX_FILE_SIZE // (1024*1024)}MB limit (free-tier Supabase Storage cap)",
+            detail=f"File exceeds limit.",
         )
 
     kb_id = str(uuid.uuid4())
@@ -148,7 +146,6 @@ async def upload_file(
         kb_id, user_id, file.filename, result["file_key"], len(file_bytes),
     )
 
-    # Auto-tag from the first-page sample the client already extracted client-side.
     sample = extracted_text_sample or file.filename
     try:
         tags = ai_service.ai_auto_arrange(sample)
@@ -168,8 +165,6 @@ async def upload_file(
         __import__("json").dumps(tags),
     )
 
-    # Best-effort full-text indexing for RAG chat. Only attempted for PDFs, and
-    # never blocks the READY status above if it fails — chat just won't find this doc.
     if file.filename.lower().endswith(".pdf"):
         try:
             with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
@@ -181,7 +176,7 @@ async def upload_file(
                 {"knowledge_base_id": kb_id, "target_subject": tags["target_subject"]},
             )
         except Exception:
-            pass  # tagging already succeeded; indexing is a bonus, not required
+            pass
 
     return {"knowledge_base_id": kb_id, "status": "READY", "tags": tags}
 
@@ -210,12 +205,12 @@ async def delete_knowledge_base(kb_id: str, user_id: str = Depends(auth.get_curr
     try:
         storage.delete_file(row["cloud_storage_key"])
     except Exception:
-        pass  # DB row is the source of truth for the app; storage cleanup best-effort
+        pass
     await pool.execute("DELETE FROM knowledge_base WHERE id = $1", kb_id)
     return {"deleted": True}
 
 
-# ---------- AI chat (RAG over the user's own uploaded materials) ----------
+# ---------- AI Chat ----------
 
 @app.post("/ai/chat")
 async def ai_chat(req: ChatRequest, user_id: str = Depends(auth.get_current_user_id)):
@@ -225,7 +220,7 @@ async def ai_chat(req: ChatRequest, user_id: str = Depends(auth.get_current_user
         raise HTTPException(status_code=502, detail=f"AI chat failed: {e}")
 
 
-# ---------- Mock tests ----------
+# ---------- Mock Tests ----------
 
 @app.post("/mock-tests/generate")
 async def generate_mock_test_endpoint(req: GenerateMockTestRequest, user_id: str = Depends(auth.get_current_user_id)):
@@ -254,7 +249,6 @@ async def submit_test_attempt(req: SubmitAttemptRequest, user_id: str = Depends(
         
     test_data = __import__("json").loads(row["structure_json"])
     questions = test_data.get("questions", [])
-    
     grading = ai_service.grade_attempt(questions, req.answers)
     attempt_id = str(uuid.uuid4())
     
@@ -274,4 +268,20 @@ async def generate_routine_endpoint(req: RoutineRequest, user_id: str = Depends(
         schedule = ai_service.generate_routine(req.available_hours_per_day, req.focus_targets)
         return {"routine": schedule}
     except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Routine generation failed: {e}")
+
+
+@app.post("/current-affairs/digest")
+async def digest_current_affairs(req: CurrentAffairsDigestRequest, user_id: str = Depends(auth.get_current_user_id)):
+    try:
+        summary = ai_service.summarize_current_affairs(req.raw_text, req.target_exam)
+        return summary
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Current affairs parsing failed: {e}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    bind_port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=bind_port)
     
