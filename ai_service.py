@@ -7,11 +7,14 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
-embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+# Securely extract the API key string
+gemini_key = os.getenv("GEMINI_API_KEY")
+
+# Pass the API key explicitly to LangChain embeddings to prevent DefaultCredentialsError
+embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004", google_api_key=gemini_key)
 vector_db = Chroma(persist_directory="./chroma_db", embedding_function=embeddings)
 
-# Securely extract the API key string and prevent SDK credential fallback errors
-gemini_key = os.getenv("GEMINI_API_KEY")
+# Initialize the Gemini GenAI Client
 AI_CLIENT = genai.Client(api_key=gemini_key)
 MODEL = "gemini-2.5-flash"
 
