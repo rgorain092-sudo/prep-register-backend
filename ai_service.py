@@ -1,6 +1,6 @@
 import os
 import json
-import fitz  # PyMuPDF
+from pypdf import PdfReader  # Clean, compilation-free PDF library for Render
 from google import genai
 from google.genai import types
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -28,11 +28,16 @@ Respond ONLY with valid JSON, no markdown fences, matching:
 
 def extract_text_from_pdf(local_path: str, max_pages: int = 3000) -> str:
     """Local extraction only — file must already be downloaded from storage."""
-    doc = fitz.open(local_path)
+    reader = PdfReader(local_path)
     pages = []
-    for i in range(min(max_pages, len(doc))):
-        pages.append(doc[i].get_text())
-    doc.close()
+    
+    # Safely iterate through pages up to the max limit
+    num_pages = min(max_pages, len(reader.pages))
+    for i in range(num_pages):
+        page_text = reader.pages[i].extract_text()
+        if page_text:
+            pages.append(page_text)
+            
     return "\n".join(pages)
 
 
