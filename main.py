@@ -38,6 +38,15 @@ async def shutdown():
     await pool.close()
 
 
+@app.get("/")
+async def root():
+    return {
+        "message": "Welcome to The Prep Register AI Learning Engine Backend Platform!",
+        "status": "fully_operational",
+        "documentation": "/docs"
+    }
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -243,12 +252,16 @@ async def generate_mock_test_endpoint(req: GenerateMockTestRequest, user_id: str
 
 @app.post("/mock-tests/submit")
 async def submit_test_attempt(req: SubmitAttemptRequest, user_id: str = Depends(auth.get_current_user_id)):
-    row = await pool.fetchrow("SELECT structure_json FROM mock_tests WHERE id = $1 AND user_id = $2", req.test_id, user_id)
+    row = await pool.fetchrow(
+        "SELECT structure_json FROM mock_tests WHERE id = $1 AND user_id = $2", 
+        req.test_id, user_id
+    )
     if not row:
-        raise HTTPException(status_code=404, detail="Test not found")
+        raise HTTPException(status_code=404, detail="Test structure reference parameters not found")
         
     test_data = __import__("json").loads(row["structure_json"])
     questions = test_data.get("questions", [])
+    
     grading = ai_service.grade_attempt(questions, req.answers)
     attempt_id = str(uuid.uuid4())
     
@@ -281,7 +294,4 @@ async def digest_current_affairs(req: CurrentAffairsDigestRequest, user_id: str 
 
 
 if __name__ == "__main__":
-    import uvicorn
-    bind_port = int(os.getenv("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=bind_port)
     
