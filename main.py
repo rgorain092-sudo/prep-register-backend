@@ -15,10 +15,12 @@ import current_affairs_service
 
 app = FastAPI(title="AI Learning Platform")
 
+# Allow the frontend (hosted on a different domain — Netlify/Cloudflare Pages)
+# to call this API. Lock this down to your real frontend URL in production.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -36,15 +38,6 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     await pool.close()
-
-
-@app.get("/")
-async def root():
-    return {
-        "message": "Welcome to The Prep Register AI Learning Engine Backend Platform!",
-        "status": "fully_operational",
-        "documentation": "/docs"
-    }
 
 
 @app.get("/health")
@@ -75,7 +68,7 @@ class GenerateMockTestRequest(BaseModel):
 
 class SubmitAttemptRequest(BaseModel):
     test_id: str
-    answers: list[int]
+    answers: list[int]  # selected option index per question, in order
 
 
 class ChatRequest(BaseModel):
@@ -128,7 +121,7 @@ async def me(user_id: str = Depends(auth.get_current_user_id)):
     return dict(row)
 
 
-# ---------- Storage ----------
+# ---------- Storage: single-shot upload (Supabase Storage, 50MB free-tier cap) ----------
 
 @app.post("/storage/upload")
 async def upload_file(
@@ -140,7 +133,7 @@ async def upload_file(
     if len(file_bytes) > storage.MAX_FILE_SIZE:
         raise HTTPException(
             status_code=413,
-            detail=f"File exceeds limit.",
+            detail=f"File exceeds {storage.MAX_FILE_SIZE // (1024*1024)}MB limit (free-tier Supabase Storage cap)",
         )
 
     kb_id = str(uuid.uuid4())
@@ -155,6 +148,7 @@ async def upload_file(
         kb_id, user_id, file.filename, result["file_key"], len(file_bytes),
     )
 
+    # Auto-tag from the first-page sample the client already extracted client-side.
     sample = extracted_text_sample or file.filename
     try:
         tags = ai_service.ai_auto_arrange(sample)
@@ -174,6 +168,8 @@ async def upload_file(
         __import__("json").dumps(tags),
     )
 
+    # Best-effort full-text indexing for RAG chat. Only attempted for PDFs, and
+    # never blocks the READY status above if it fails — chat just won't find this doc.
     if file.filename.lower().endswith(".pdf"):
         try:
             with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
@@ -185,7 +181,7 @@ async def upload_file(
                 {"knowledge_base_id": kb_id, "target_subject": tags["target_subject"]},
             )
         except Exception:
-            pass
+            pass  # tagging already succeeded; indexing is a bonus, not required
 
     return {"knowledge_base_id": kb_id, "status": "READY", "tags": tags}
 
@@ -214,12 +210,12 @@ async def delete_knowledge_base(kb_id: str, user_id: str = Depends(auth.get_curr
     try:
         storage.delete_file(row["cloud_storage_key"])
     except Exception:
-        pass
+        pass  # DB row is the source of truth for the app; storage cleanup best-effort
     await pool.execute("DELETE FROM knowledge_base WHERE id = $1", kb_id)
     return {"deleted": True}
 
 
-# ---------- AI Chat ----------
+# ---------- AI chat (RAG over the user's own uploaded materials) ----------
 
 @app.post("/ai/chat")
 async def ai_chat(req: ChatRequest, user_id: str = Depends(auth.get_current_user_id)):
@@ -229,69 +225,133 @@ async def ai_chat(req: ChatRequest, user_id: str = Depends(auth.get_current_user
         raise HTTPException(status_code=502, detail=f"AI chat failed: {e}")
 
 
-# ---------- Mock Tests ----------
+# ---------- Mock tests ----------
 
 @app.post("/mock-tests/generate")
-async def generate_mock_test_endpoint(req: GenerateMockTestRequest, user_id: str = Depends(auth.get_current_user_id)):
+async def generate_mock_test(req: GenerateMockTestRequest, user_id: str = Depends(auth.get_current_user_id)):
     try:
         payload = ai_service.generate_mock_test(req.domain, req.target_tag, req.difficulty, req.num_questions)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Mock test generation failed: {e}")
 
     test_id = str(uuid.uuid4())
-    questions_list = payload.get("questions", [])
-    total_questions = len(questions_list)
-    
+    total_marks = len(payload["questions"])
     await pool.execute(
-        """INSERT INTO mock_tests (id, user_id, domain, target_tag, difficulty, total_questions, structure_json)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)""",
-        test_id, user_id, req.domain, req.target_tag, req.difficulty, total_questions, __import__("json").dumps(payload)
+        """INSERT INTO mock_test_series
+           (id, title, associated_domain, target_tag, difficulty, duration_minutes, total_marks, question_payload)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)""",
+        test_id, f"{req.target_tag} — {req.difficulty.title()}", req.domain, req.target_tag,
+        req.difficulty, req.duration_minutes, total_marks, __import__("json").dumps(payload),
     )
-    return {"test_id": test_id, "questions": questions_list, "duration_minutes": req.duration_minutes}
+    # Strip correct_index/explanation before returning so the client can't cheat by reading the payload.
+    questions_for_client = [
+        {"question": q["question"], "options": q["options"]} for q in payload["questions"]
+    ]
+    return {
+        "test_id": test_id, "title": f"{req.target_tag} — {req.difficulty.title()}",
+        "duration_minutes": req.duration_minutes, "questions": questions_for_client,
+    }
+
+
+@app.get("/mock-tests")
+async def list_mock_tests(domain: Optional[str] = None):
+    if domain:
+        rows = await pool.fetch(
+            "SELECT id, title, associated_domain, target_tag, difficulty, duration_minutes, total_marks, created_at "
+            "FROM mock_test_series WHERE associated_domain = $1 ORDER BY created_at DESC", domain,
+        )
+    else:
+        rows = await pool.fetch(
+            "SELECT id, title, associated_domain, target_tag, difficulty, duration_minutes, total_marks, created_at "
+            "FROM mock_test_series ORDER BY created_at DESC LIMIT 50"
+        )
+    return [dict(r) for r in rows]
 
 
 @app.post("/mock-tests/submit")
-async def submit_test_attempt(req: SubmitAttemptRequest, user_id: str = Depends(auth.get_current_user_id)):
-    row = await pool.fetchrow(
-        "SELECT structure_json FROM mock_tests WHERE id = $1 AND user_id = $2", 
-        req.test_id, user_id
-    )
+async def submit_attempt(req: SubmitAttemptRequest, user_id: str = Depends(auth.get_current_user_id)):
+    row = await pool.fetchrow("SELECT question_payload FROM mock_test_series WHERE id = $1", req.test_id)
     if not row:
-        raise HTTPException(status_code=404, detail="Test structure reference parameters not found")
-        
-    test_data = __import__("json").loads(row["structure_json"])
-    questions = test_data.get("questions", [])
-    
-    grading = ai_service.grade_attempt(questions, req.answers)
+        raise HTTPException(status_code=404, detail="Test not found")
+    import json
+    payload = row["question_payload"]
+    payload = json.loads(payload) if isinstance(payload, str) else payload
+    result = ai_service.grade_attempt(payload["questions"], req.answers)
+
     attempt_id = str(uuid.uuid4())
-    
     await pool.execute(
-        """INSERT INTO test_attempts (id, test_id, user_id, score_obtained, total_questions, review_json)
+        """INSERT INTO test_attempts (id, user_id, test_id, score_obtained, accuracy_percentage, ai_performance_feedback)
            VALUES ($1, $2, $3, $4, $5, $6)""",
-        attempt_id, req.test_id, user_id, grading["correct"], grading["total"], __import__("json").dumps(grading)
+        attempt_id, user_id, req.test_id, result["correct"], result["accuracy_percentage"],
+        f"{result['correct']}/{result['total']} correct.",
     )
-    return {"attempt_id": attempt_id, "grading": grading}
+    return {"attempt_id": attempt_id, **result}
 
 
-# ---------- Routines & Current Affairs ----------
+@app.get("/test-attempts")
+async def my_attempts(user_id: str = Depends(auth.get_current_user_id)):
+    rows = await pool.fetch(
+        """SELECT ta.id, ta.score_obtained, ta.accuracy_percentage, ta.attempted_at,
+                  mt.title, mt.target_tag, mt.difficulty
+           FROM test_attempts ta JOIN mock_test_series mt ON mt.id = ta.test_id
+           WHERE ta.user_id = $1 ORDER BY ta.attempted_at DESC""",
+        user_id,
+    )
+    return [dict(r) for r in rows]
 
-@app.post("/routines/generate")
-async def generate_routine_endpoint(req: RoutineRequest, user_id: str = Depends(auth.get_current_user_id)):
+
+# ---------- Study routine ----------
+
+@app.post("/routine/generate")
+async def generate_routine_route(req: RoutineRequest, user_id: str = Depends(auth.get_current_user_id)):
     try:
-        schedule = ai_service.generate_routine(req.available_hours_per_day, req.focus_targets)
-        return {"routine": schedule}
+        routine = ai_service.generate_routine(req.available_hours_per_day, req.focus_targets)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Routine generation failed: {e}")
 
+    await pool.execute("DELETE FROM study_routines WHERE user_id = $1", user_id)
+    for block in routine:
+        await pool.execute(
+            """INSERT INTO study_routines (id, user_id, day_of_week, start_time, end_time, focus_domain, topic_headline)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)""",
+            str(uuid.uuid4()), user_id, block["day"], block["start_time"], block["end_time"],
+            block["domain_type"], block["topic"],
+        )
+    await pool.execute(
+        "UPDATE users SET daily_study_hours = $2 WHERE id = $1", user_id, req.available_hours_per_day
+    )
+    return {"routine": routine}
+
+
+@app.get("/routine")
+async def get_routine(user_id: str = Depends(auth.get_current_user_id)):
+    rows = await pool.fetch(
+        "SELECT * FROM study_routines WHERE user_id = $1 ORDER BY day_of_week, start_time", user_id
+    )
+    return [dict(r) for r in rows]
+
+
+@app.patch("/routine/{block_id}/complete")
+async def complete_block(block_id: str, user_id: str = Depends(auth.get_current_user_id)):
+    row = await pool.fetchrow(
+        "SELECT 1 FROM study_routines WHERE id = $1 AND user_id = $2", block_id, user_id
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Not found")
+    await pool.execute("UPDATE study_routines SET completed = TRUE WHERE id = $1", block_id)
+    return {"completed": True}
+
+
+# ---------- Current affairs ----------
 
 @app.post("/current-affairs/digest")
-async def digest_current_affairs(req: CurrentAffairsDigestRequest, user_id: str = Depends(auth.get_current_user_id)):
+async def add_current_affairs_digest(req: CurrentAffairsDigestRequest):
     try:
-        summary = ai_service.summarize_current_affairs(req.raw_text, req.target_exam)
-        return summary
+        return await current_affairs_service.create_digest_entry(pool, req.target_exam, req.raw_text)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Current affairs parsing failed: {e}")
+        raise HTTPException(status_code=502, detail=f"Digest summarization failed: {e}")
 
 
-if __name__ == "__main__":
-    
+@app.get("/current-affairs")
+async def get_current_affairs(target_exam: str):
+    return await current_affairs_service.list_for_exam(pool, target_exam)
