@@ -32,7 +32,7 @@ pool: Optional[asyncpg.Pool] = None
 @app.on_event("startup")
 async def startup():
     global pool
-    pool = await asyncpg.create_pool(DB_DSN)
+    pool = await asyncpg.create_pool(DB_DSN, min_size=1, max_size=5)
 
 
 @app.on_event("shutdown")
